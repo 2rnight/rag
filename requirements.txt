@@ -5,16 +5,16 @@ python-multipart>=0.0.9
 pydantic>=2.7
 pydantic-settings>=2.3
 
-# ===== 模型编排（LangChain 统一大模型接口） =====
-langchain>=0.3
+# ===== 模型编排（只用 LangChain 的接口层，不要全家桶） =====
+# langchain-core         自定义 Embeddings / BaseChatModel 的接口与消息类型
+# langchain-openai       ChatOpenAI（DashScope 兼容 OpenAI 协议，同时覆盖 GPT）
+# langchain-community    FAISS 向量库集成（DistanceStrategy.MAX_INNER_PRODUCT）
 langchain-core>=0.3
 langchain-community>=0.3
 langchain-openai>=0.2
-langchain-text-splitters>=0.3
 
 # ===== 向量检索 =====
-faiss-cpu>=1.8
-numpy>=1.26
+faiss-cpu>=1.8        # numpy 由它带入，本项目不直接 import numpy（归一化用 math）
 
 # ===== 文档解析（多格式） =====
 pypdf>=4.2

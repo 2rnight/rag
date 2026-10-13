@@ -170,7 +170,69 @@ Word 表格会转成 Markdown 表格；PDF 无文字层会明确报"疑似扫描
 
 ---
 
-## 6. 容易被问到的"细节坑"（提前准备）
+## 6. 依赖与数据流（追问密集区）
+
+### 6.1 依赖：我到底用了 LangChain 的哪一部分？
+
+**只用接口层，不用框架。** 具体三块（其余全是标准库 + 一个 FAISS）：
+
+| 依赖 | 用在哪一行 | 干什么 |
+| --- | --- | --- |
+| `langchain-core` | `rag/embeddings.py` 继承 `Embeddings`；`rag/llm.py` 继承 `BaseChatModel`；`rag/prompts.py` 用 `SystemMessage/HumanMessage` | 拿到"统一模型接口"：业务层只认 `astream/invoke`，换上游只改配置 |
+| `langchain-openai` | `rag/llm.py` 里 `ChatOpenAI` | 一个 `base_url` 同时对接 DashScope 兼容模式（qwen-plus）与 OpenAI |
+| `langchain-community` | `rag/vector_store.py` 里的 `FAISS` + `DistanceStrategy.MAX_INNER_PRODUCT` | 复用成熟的 FAISS 增删/落盘，不自造轮子 |
+
+**没装的东西同样是答案**：不装 `langchain` 元包（会连带 `langgraph` 全家桶，本次清理砍掉 6 个包，锁文件 94→88）、不装 `langchain-text-splitters`
+（切片逻辑要"回退句尾/对齐句首/短段聚合/跨块保留 heading_path"，自己写更可控）、不直连 `numpy`（归一化用 `math.sqrt`，numpy 由 faiss 带入）、
+不引入向量数据库、不引入 jieba（中文用"单字 + bigram"，无词典、无 OOV、无额外依赖）。
+
+> 稳的说法：**"我把 LangChain 当 SDK 用，不当框架用"**——接口用它、编排自己写（`rag/pipeline.py`），
+> 这样链路每一跳的耗时、分数、降级点都是可见、可测、可解释的。
+
+### 6.2 数据流：入库（离线）
+
+```
+文件 →① sha256 查台账（新增/变更/幂等跳过）
+     →② DocumentLoader.parse → list[ParsedDocument]{ text, metadata{source_file, heading_path, page, doc_type, parser, quality} }
+     →③ OverlapChunker：group_blocks 先聚合小节 → 500/100（20%）滑窗，右边界回退句尾、左框对齐句首
+        → Chunk{ chunk_id="docid-0003", text, metadata{char_start/char_end/overlap_chars/heading_path/chunk_strategy} }
+     →④ embed_documents：10 条/批、单条 6000 字截断、重试 3 次、L2 归一化（查询向量还有 512 条 LRU 缓存）
+     →⑤ 一次性落盘 5 个文件：index.faiss / index.pkl / chunks.jsonl / bm25.json / registry.json / manifest.json
+```
+
+**5 个落盘文件各自的职责**（被问"你怎么持久化的"就按这个答）：
+`index.faiss`（向量）、`index.pkl`（FAISS 自带 docstore，id=chunk_id）、`chunks.jsonl`（片段原文+元数据，命中后回填文本）、
+`bm25.json`（倒排 postings + 长度，用于重建 IDF）、`registry.json`（文档台账：hash/块数/质量分/入库时间，负责幂等与增量）、
+`manifest.json`（embedding 指纹 `provider:model:dim` + 切片参数 → 换模型后复用旧索引会被显式拦住）。
+
+### 6.3 数据流：问答（在线）——每一步的数据结构
+
+```
+question →（LRU 命中则跳过）embedding → L2 归一化
+   → 稠密 FAISS top20（分数=余弦）  ＋  稀疏 BM25 top20（SparseHit{chunk_id, score, matched_terms}）
+   → _fuse：RRF 1/(60+rank) 两路相加 → Hit{chunk_id, text, metadata, score, sparse_score, fusion_score, dense_rank, sparse_rank}
+   → 入选上下文（任一路证据达标）→ 拒答判定（dense_ok ∨ sparse_ok）→ 邻居扩展 ±1 → 前缀去重 → 最多 8 条
+   → SSE meta（sources/top_score/阈值/检索耗时）
+   → build_context_block（3000 token 预算、单块 ≤700、块头带 [n] 来源/页码/章节/相关度）
+   → build_messages → SystemMessage(规则+动态规则) + HumanMessage(最近 3 轮 + <<<CONTEXT>>> 资料 + 问题)
+   → llm.astream → StreamDelta{text, fallback, index} → 每片 SSE delta（**第一个非空 delta 的时刻 = TTFT**）
+   → verify_answer（引用标注 + bigram 覆盖率 ≥0.20）→ SSE done（含 ttft_ms/total_ms/llm_ms/grounding/citations/context_tokens）
+```
+
+**为什么这么切分（一句一个理由）**：检索先于生成返回 `meta` → 前端先渲染引用卡片，感知延迟更低；
+判定三路联合 → 单靠余弦在私域长文档上不稳；邻居扩展 → 答案被切在块边界时仍完整；前缀去重 → 20% 重叠窗口必然产生近似块；
+准入即写入 token 预算 → 避免"取完 top-k 再截断"导致引用与实际上下文不一致。
+
+### 6.4 追问速答
+
+* **内存/规模？** 单机常驻：向量 `片段数 × 维度 × 4B`（30×1024×4B ≈ 120KB），加上片段原文与 BM25 倒排，万级片段的量级是几十 MB ~ 百 MB 级；再往上换 IVF/HNSW 或外部向量库。
+* **并发？** 检索是纯计算（1–3ms）不阻塞；瓶颈在上游 LLM 首包，所以 SSE + 异步 + 首包超时降级是主要手段。
+* **增量更新怎么保证一致？** 台账 hash 判定 → 变更时"先删旧片段（FAISS/ChunkStore/BM25/台账四处同步）再入新片段"，未变直接跳过；删除文档同理，有单测覆盖。
+* **离线兜底存在的意义？** 让"没配 Key / 网络不通"时全链路仍可演示与回归测试（CI 无密钥也能跑 51 个用例、跑评测与压测），而不是给生产用。
+
+---
+
+## 7. 容易被问到的"细节坑"（提前准备）
 
 1. **FAISS 的分数方向**：`IndexFlatL2` 是"越小越像"，我用 L2 归一化 + `MAX_INNER_PRODUCT`，让分数=余弦（越大越像），阈值才好理解；
 2. **langchain FAISS 的 `normalize_L2`**：它只对 EUCLIDEAN 生效，用内积时会告警，所以我在自己的 `Embeddings` 层做归一化，显式关掉它的归一化；
@@ -185,7 +247,7 @@ Word 表格会转成 Markdown 表格；PDF 无文字层会明确报"疑似扫描
 
 ---
 
-## 7. 反问面试官（结尾留印象）
+## 8. 反问面试官（结尾留印象）
 
 * 团队现在的 RAG 是自建还是用平台？检索质量是用人工评测还是 RAGAS 这类自动指标？
 * 线上对幻觉的容忍度如何——更怕"乱答"还是更怕"不答"？（决定阈值策略）
@@ -194,7 +256,7 @@ Word 表格会转成 Markdown 表格；PDF 无文字层会明确报"疑似扫描
 
 ---
 
-## 8. 简历措辞对照（你可以这样写，我都验证过）
+## 9. 简历措辞对照（你可以这样写，我都验证过）
 
 * **文本处理与向量化 pipeline**：混合解析器 + 重叠窗口（Overlap 20%）切片 + `text-embedding-v3` + FAISS 本地索引与相似度召回 ✅（`rag/loaders.py`、`rag/chunking.py`、`rag/embeddings.py`、`rag/vector_store.py`）
 * **低延迟流式响应架构**：FastAPI 异步 + SSE 流式输出，TTFT 降 80%+（脚本实测 −88.6%，3.2s→0.36s）✅（`api/sse.py`、`scripts/benchmark_ttft.py`）

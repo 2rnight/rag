@@ -58,6 +58,120 @@
 
 ---
 
+## 2.1 核心依赖与选型理由（只装真正用到的）
+
+| 层 | 依赖 | 实测版本 | 在本仓库的具体用途（调用点） | 为什么是它 |
+| --- | --- | --- | --- | --- |
+| Web | **fastapi** | 0.143.0 | 12 个端点、依赖注入、`StreamingResponse` 实现 SSE、自动 OpenAPI 文档（`app.py` `api/routes.py`） | 原生 async；SSE 只需一个 `StreamingResponse`，不需要额外库 |
+| | **uvicorn[standard]** | 0.54.0 | ASGI 服务器（含 uvloop / httptools / watchfiles） | FastAPI 标准搭档，`--reload` 开发友好 |
+| | **python-multipart** | 0.0.32 | **代码里不 import**——它是 FastAPI 解析 `multipart/form-data`（`UploadFile`）的运行期要求 | 少它上传接口直接 500 |
+| | **pydantic** / **pydantic-settings** | 2.14.1 / 2.15.0 | 请求响应模型（`api/schemas.py`）；62 项配置项，`RAG_` 前缀 + `AliasChoices` 兼容 `DASHSCOPE_API_KEY` / `OPENAI_API_KEY`（`config.py`） | 类型校验 + 环境变量即配置，省掉手写解析与校验 |
+| LangChain 接口层 | **langchain-core** | 1.6.10 | 子类化 `Embeddings`（L2 归一化 + 指纹）与 `BaseChatModel`（流式 / 降级）；`SystemMessage`/`HumanMessage`/`AIMessage`；`ChatGenerationChunk` | 只取"统一接口"这一层，**不引入框架黑盒** |
+| | **langchain-openai** | 1.7.1 | `ChatOpenAI` 同时对接 DashScope 的 OpenAI 兼容模式（qwen-plus）与 OpenAI 官方（`rag/llm.py`） | 改一个 `base_url` 就能切上游，业务层只认 `astream` |
+| | **langchain-community** | 0.4.2 | `FAISS` 向量库封装 + `DistanceStrategy.MAX_INNER_PRODUCT`（`rag/vector_store.py`） | 复用成熟的 FAISS 增删 / 落盘逻辑，不自造轮子 |
+| 向量 | **faiss-cpu** | 1.15.1 | `IndexFlatIP`（归一化后内积 = 余弦）、增量 `add_documents` / `delete`、`save_local` 落盘 | 本地零运维、毫秒级检索；numpy 由它带入 |
+| 解析 | **pypdf** | 6.20.1 | PDF 双策略竞争解析（普通模式 vs layout 模式，按质量分择优） | 纯 Python、无系统依赖（不需要 poppler） |
+| | **python-docx** | 1.2.0 | Word 段落 + 表格 → Markdown | 比 docx2txt 保留结构（表格不丢） |
+| | **beautifulsoup4** + **lxml** | 4.15.0 / 6.1.3 | HTML 清洗（去 script/style/导航/页脚） | lxml 解析快且容错，bs4 提供选择器 |
+| 网络 | **httpx** | 0.28.1 | 向量化 HTTP 调用（DashScope / OpenAI embeddings 兼容接口），显式超时与指数退避 | async 客户端，超时可控且不阻塞事件循环 |
+| 测试 | **pytest** / **pytest-asyncio** | 9.1.1 / 1.4.0 | 51 个用例，`asyncio_mode=auto` 直接测 async（`tests/`） | — |
+
+**刻意没装的（避免"依赖全家桶"）**
+
+| 没装 | 原因 |
+| --- | --- |
+| `langchain` 元包 | 代码只用到 `langchain-core` / `-openai` / `-community`；元包会连带拉进 `langgraph` 全家桶。本次清理共减 6 个包（`langchain`、`langgraph`、`langgraph-checkpoint`、`langgraph-prebuilt`、`langgraph-sdk`、`ormsgpack`），锁文件 **94 → 88** |
+| `langchain-text-splitters` | 切片器是自研的 `OverlapChunker`：需要"右边界回退到句尾、左边界对齐句首、短小节先聚合、跨块保留 heading_path"这些约束，通用 splitter 给不了 |
+| `numpy`（直连） | 归一化用 `math.sqrt` 手写就够（30 片段规模无性能必要）；numpy 由 `faiss-cpu` 作为传递依赖带入。**依赖清单里只放自己直接 import 的包** |
+| 向量数据库（Chroma / Milvus / pgvector） | 单机 + 万级片段内 FAISS 足够，还能白拿"本地零运维"；换库的成本被 `FaissVectorStore` 这一层封装隔离 |
+| 中文分词（jieba / pkuseg） | 用"单字 + 相邻 bigram"免词典分词：无 OOV、无版本差异、无额外依赖；实测对企业文档里的专名/编号（`V3.2`、`192.168.1.102`）召回更稳 |
+| sentence-transformers / 本地大模型 | 生产路径走 API（`text-embedding-v3` / qwen-plus）；离线兜底用 n-gram hash，保证"不配 Key 也能跑通全链路" |
+
+---
+
+## 2.2 端到端数据流（每个环节的数据结构都标出来）
+
+### A. 离线：入库与索引（一次，可增量）
+
+```
+文件 bytes
+  │  ① 幂等闸门   pipeline.ingest_file(path, force=False)
+  │     sha256(file) → 查 registry.json：未登记=新增；hash 变了=先删旧片段再入；hash 未变=skipped(幂等)
+  ▼
+DocumentLoader.parse(path) → list[ParsedDocument] + ParseReport
+  │     ParsedDocument{ text, metadata:{ source_file, heading_path, page, doc_type, parser, file_hash, quality } }
+  │     ParseReport{ parser, blocks, chars, quality, elapsed_ms, warnings[] }
+  │     · PDF：pypdf 普通模式 vs layout 模式 → 质量分（有效字符率/乱码率/碎片行率）择优；页眉页脚去重；无文字层→报"疑似扫描件"
+  │     · Word：段落 + 表格→Markdown；MD/TXT：标题层级探测 → heading_path；HTML/CSV/JSON：结构化抽取
+  ▼
+OverlapChunker.split(docs) → list[Chunk] + ChunkingStats
+  │     ① group_blocks()：贪心聚合相邻小节到接近 chunk_size（被并入的小标题仍留在 heading_paths[]）
+  │     ② _base_windows()：500 字窗口 / 100 字重叠（20%）；右边界回退到句尾、左边界对齐句首
+  │     Chunk{ chunk_id=f"{doc_id}-{序号:04d}", text, metadata:{ char_start, char_end, overlap_chars,
+  │             heading_path/heading_paths, page, chunk_strategy="overlap-20%", total_chunks } }
+  │     ChunkingStats{ chunks, chars, avg_chars, avg_overlap_chars, overlap_ratio, dropped_duplicates, elapsed_ms }
+  ▼
+embeddings.embed_documents(texts) → list[vector]
+  │     HttpEmbeddings：10 条/批（DashScope 上限）、单条 6000 字符截断、指数退避重试 3 次、超时 30s、L2 归一化
+  │     离线兜底：字符 n-gram → 固定 1024 维 hash 向量（同样归一化）
+  ▼
+四处写入 + 一份指纹清单（一次操作内保持一致）
+      index.faiss + index.pkl   FAISS 向量索引 + docstore（id = chunk_id）
+      chunks.jsonl              片段原文与元数据（ChunkStore，检索命中后回填 text/metadata）
+      bm25.json                 BM25 倒排：postings{词元 → {片段下标: tf}} + lengths
+      registry.json             文档台账：doc_id / file_hash / 大小 / blocks / chunks / chars / quality / ingested_at
+      manifest.json             指纹：embedding(provider:model:dim) + 切片参数 + 向量数 → **加载时校验，不一致拒绝启动**
+```
+
+### B. 在线：一次问答（`POST /api/v1/chat/stream`）
+
+```
+question + history
+  │  ① SSE 建连 → event: open（含心跳间隔）         ← 前端从这里开始计 TTFT
+  │  ② 查询向量：命中 LRU 缓存(512)直接用，否则调 embedding → L2 归一化
+  ▼
+混合召回（双路并行取候选，默认各 20 条）
+  │  稠密：FAISS IndexFlatIP.similarity_search_with_score(k=20) → Hit.score = 余弦
+  │  稀疏：BM25Index.search(k=20) → SparseHit{ chunk_id, score, matched_terms }
+  ▼
+_fuse() RRF 融合： fusion = 1.0/(60 + dense_rank) + 1.0/(60 + sparse_rank)
+  │     Hit{ chunk_id, text, metadata, score, sparse_score, fusion_score, retrieval, dense_rank, sparse_rank }
+  ▼
+入选上下文：任一路证据达标即可（dense ≥ 阈值 ∨ 纯 BM25 命中 ∨ sparse ≥ 8.0）   ← 修过的 bug 就在这
+  ▼
+拒答判定（三路联合）→ answerable
+  │     dense_ok  = top_score ≥ 阈值(0.20/0.30/0.35) ∧ unknown_ratio ≤ 0.60
+  │     sparse_ok = sparse_top ≥ 8.0 ∧ unknown_ratio ≤ 0.55 ∧ top_score ≥ 0.6×阈值 ∧ (standout < 0 ∨ ≥ 2.0)
+  │     answerable = dense_ok ∨ sparse_ok；否则直接兜底，**不调用 LLM**
+  ▼
+后处理：邻居扩展（±1 块，分数 ×0.98）→ 60 字前缀签名去重 → 最多 8 条
+  │  ③ event: meta { answerable, top_score, threshold, retrieval_ms, sources[] }   ← 先渲染引用卡片
+  ▼
+build_context_block(hits, token_budget=3000, per_hit_max_tokens=700)
+  │     "[n] 来源: x.txt | 页码: p | 章节: 4.1 | 相关度: 0.31 | 入库时间: ..." + 正文
+  │     超预算即停（被裁剪的块不会出现在引用里）
+  ▼
+build_messages(question, used_hits, history) → (messages, used_hits, system_prompt)
+  │     SystemMessage：角色 + 只依据资料作答 + 必须标 [n] + 标准拒答话术 + **动态规则**
+  │                   （低置信度/多来源冲突/多轮指代/含"最新·最近"→ 时效提示）
+  │     HumanMessage：最近 3 轮对话 + <<<CONTEXT>>> 契约包裹的资料块 + 当前问题
+  ▼
+llm.astream(messages) → StreamDelta{ text, fallback, index }
+  │     首 token 超时 20s → 切 ExtractiveChatModel（bigram 打分 + 数字奖励 1.5，只留 ≥0.4×最优的前 2 块）
+  │  ④ 每个增量 → event: delta { text, fallback }        ← 第一个非空 delta 的时刻就是 TTFT
+  ▼
+verify_answer()：引用标注检查 + 与资料的 bigram 覆盖率 ≥ 0.20 → grounded
+  │  ⑤ event: done { answer, refused, ttft_ms, total_ms, retrieval_ms, llm_ms, provider, model,
+  │                  fallback, grounding, citations, sources, context_tokens }
+  │  ⑥ metrics 埋点：requests(chat/stream/refusals/fallbacks) + latency(ttft/total/retrieval 的 p50/p95)
+  │  ⑦ 任意环节异常 → event: error（SSE 里报错，接口永远 200，不把 5xx 甩给前端）
+```
+
+**一句话版本**：`解析 → 聚合 → 20% 重叠切片 → 向量化(归一化) → FAISS+BM25 双索引落盘` 是离线；
+`查询向量 → 双路召回 → RRF 融合 → 三路拒答判定 → 邻居扩展/去重 → 预算内拼 Prompt → 流式生成 → 落地性校验 → SSE 事件流` 是在线。
+
+---
+
 ## 3. 快速开始
 
 ### 3.1 安装
@@ -272,7 +386,16 @@ BM25 对字面精确匹配极稳，两路**RRF 融合**（只看排名，无需�
 所以索引落盘时写入 `manifest.json`（`provider:model:dim` 指纹 + 切片参数），
 加载时校验不一致就拒绝启动并提示重建（`POST /api/v1/knowledge/rebuild`）。
 
-**Q5：上游大模型挂了怎么办？**
+**Q5：依赖为什么这么少？LangChain 你到底用了哪一部分？**
+只用了三个包，且都是接口层：`langchain-core`（子类化 `Embeddings`/`BaseChatModel`，拿统一接口）、
+`langchain-openai`（`ChatOpenAI` 一个 `base_url` 同时对接 DashScope 兼容模式与 OpenAI）、
+`langchain-community`（FAISS 集成）。**编排、切片、检索、融合、拒答、降级全部自己写**（`rag/pipeline.py` 等），
+因为链路每一跳的分数、耗时、降级点都必须可见可测。
+相应地刻意不装：`langchain` 元包（会拉进 langgraph 全家桶，本次清理砍掉 6 个包、锁文件 94→88）、
+`langchain-text-splitters`（切片约束它给不了）、直连 `numpy`（归一化用 `math.sqrt`）、
+向量数据库、jieba。**依赖清单里只放自己直接 import 的包**，这条规则让镜像更小、攻击面更小、安装更快。
+
+**Q6：上游大模型挂了怎么办？**
 三层兜底：① 首 token 超时（默认 20s）→ 切抽取式兜底；② 中途断流 → 保留已产出内容并提示"生成中断"，
 再补知识库原文摘录；③ 完全没有 Key/断网 → 全链路离线兜底模式（向量也是本地 n-gram），
 服务永远返回 200，错误以 SSE `error` 事件或降级标记的形式暴露。
