@@ -10,7 +10,7 @@
   <img alt="langchain" src="https://img.shields.io/badge/LangChain-1.x-1c3c3c">
   <img alt="faiss" src="https://img.shields.io/badge/FAISS-local%20index-4b8bbe">
   <img alt="sse" src="https://img.shields.io/badge/streaming-SSE-ff6f61">
-  <img alt="tests" src="https://img.shields.io/badge/tests-49%20passed-3ddc97">
+  <img alt="tests" src="https://img.shields.io/badge/tests-51%20passed-3ddc97">
 </p>
 
 ---
@@ -25,7 +25,7 @@
 | **低延迟流式架构（SSE）** | FastAPI 异步 + `StreamingResponse` 逐事件下发，`X-Accel-Buffering: no` 关闭反代缓冲 + 心跳保活；**检索先于生成返回** meta 事件，前端先渲染引用卡片 | `api/sse.py` `api/routes.py` |
 | **首字响应（TTFT）降低 80%+** | 压测脚本用可控模拟上游对比两条链路：**≈3.2s → ≈0.36s（−88.6%）** | `scripts/benchmark_ttft.py` |
 | **动态 Prompt + 拒答兜底，缓解幻觉** | 上下文按 token 预算裁剪、引用编号注入、按检索结果**动态**追加规则（低置信度/多来源冲突/多轮指代/时效提示）、拒答文案写进 Prompt；生成后再做**落地性校验**（引用标注 + bigram 覆盖率） | `rag/prompts.py` `rag/llm.py` |
-| **私域测试集准确率 90%+** | 内置 32 题域内 + 11 题域外（含困难负例）评测集与评测脚本，离线模式即达 **综合 93.0%**（可 `--tune` 重新校准阈值） | `tests/data/eval_set.json` `scripts/evaluate.py` |
+| **私域测试集准确率 90%+** | 内置 32 题域内 + 11 题域外（含困难负例）评测集与评测脚本，离线模式**综合 90.7%**（可 `--tune` 重新校准阈值） | `tests/data/eval_set.json` `scripts/evaluate.py` |
 
 ---
 
@@ -62,12 +62,46 @@
 
 ### 3.1 安装
 
+推荐用 [uv](https://docs.astral.sh/uv/)（毫秒级解析、自动管理 Python 版本），也支持原生 pip。
+
 ```bash
 git clone <this-repo> && cd rag
 
-python -m venv .venv && source .venv/bin/activate     # 或 uv venv
-pip install -r requirements.txt                        # 或 uv sync
+# ① 装 uv（一次性）
+curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS / Linux
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+# 或用 pip：pip install uv
+
+# ② 路线 A（推荐）：按锁文件还原，完全可复现
+uv sync                       # 建 .venv + 装运行时依赖 + 装 pytest 等 dev 依赖 + 装本项目（可编辑）
+uv run uvicorn app:app        # 不用手动 activate，uv run 自动在项目环境里执行
+uv run pytest -q              # 51 passed
+uv run rag status             # CLI 入口点（已随项目一起安装）
+
+# ③ 路线 B：只想用 requirements.txt（和旧流程一致）
+uv venv                       # 建 .venv（按 .python-version 自动选/下载 Python）
+uv pip install -r requirements.txt
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
+uvicorn app:app
+
+# ④ 不用 uv 的原生 pip 路线
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+**几个容易踩的点**
+
+* **`uv.lock` 是权威**：`uv sync` 严格按锁文件装（可复现、带哈希校验）。改了 `pyproject.toml` 后要 `uv lock` 重新解析
+  （或 `uv sync --upgrade` 顺手升级）。CI 里断言"锁文件没落后"用 `uv sync --locked`；
+  只想按现有锁文件装、绝不允许改写用 `uv sync --frozen`。
+* **只装运行时依赖**：`uv sync --no-dev`（服务器/镜像里用，省掉 pytest）。
+* **Python 版本**：仓库里 `.python-version` 钉的是 3.10，`uv` 会自己下载对应版本；
+  本机已有别的版本时用 `uv venv --python 3.12`，或 `uv python install 3.10` 先装好。
+* **`uv run` 前的 `activate` 可以省**：`uv run <cmd>` 本身就是"在这个项目的环境里执行"，
+  也正因如此它会在需要时自动 `sync`（不想让它自动同步就加 `--no-sync`）。
+* **uv 没有 `pip install -e .` 的对应命令**：要装成本项目可编辑包就用 `uv sync`（`pyproject.toml` 里已开 `package = true`）。
+* **导出成传统依赖清单**（部署到不支持 uv 的环境时）：
+  `uv export --no-dev --format requirements-txt > requirements.lock.txt`（带精确版本与哈希）。
 
 ### 3.2 配置（可选，不配也能跑）
 
@@ -95,7 +129,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 ```bash
 make dev        # 等价：一键安装+索引+启动（见 Makefile）
-make test       # 49 个单测/集成测试（离线可跑，无需 API Key）
+make test       # 51 个单测/集成测试（离线可跑，无需 API Key）
 make eval       # 私域测试集评测（检索命中率/要点覆盖率/拒答准确率）
 make bench      # TTFT 压测（模拟可控上游）
 ```
@@ -158,19 +192,31 @@ curl -N -X POST localhost:8000/api/v1/chat/stream \
 
 | 指标 | 离线兜底模式（无 Key） | 说明 |
 | --- | --- | --- |
-| 检索命中率 hit@k | **90.6%** | 期望文档是否出现在召回结果里 |
-| 答案要点覆盖率 | **87.5%** | 答案是否命中标注的关键信息（如"5 天""ZhiYuan@2024"） |
-| 可答准确率（域内） | **93.8%**（30/32） | 是否误拒了能回答的问题 |
+| 检索命中率 hit@k | **90.6%**（29/32） | 期望文档是否出现在召回结果里 |
+| 答案要点覆盖率 | **87.9%**（29/33） | 答案是否命中标注的关键信息（如"5 天""ZhiYuan@2024"） |
+| 可答准确率（域内） | **90.6%**（29/32） | 是否误拒了能回答的问题 |
 | 拒答准确率（域外） | **90.9%**（10/11） | 幻觉防线：不该答的要拒答 |
-| **综合准确率** | **93.0%** | 域内可答 + 域外拒答 |
-| 单题平均耗时（不含 LLM） | 4.5 ms（p95 3.8 ms） | 检索 + 组装 Prompt |
+| **综合准确率** | **90.7%**（39/43） | 域内可答 + 域外拒答 |
+| 整体判定（含困难负例） | **90.7%** | 命中率与两项判定一起算 |
+| 单题平均耗时（不含 LLM） | 4.1 ms（p95 3.2 ms） | 检索 + 组装 Prompt |
 
 配置 `DASHSCOPE_API_KEY` 后使用 `text-embedding-v3 + qwen-plus`，语义召回会把上述指标进一步推高（尤其是"说不出关键词但意思相同"的问法）。
 阈值不是拍脑袋定的：`python -m scripts.evaluate --tune` 会在私域测试集上**网格搜索**相似度阈值与 BM25 救援阈值，输出准确率最高的参数组合。
 
-> 已知限制（诚实记录）：离线词法模式唯一漏判的域外问题是
-> 「北京到上海的高铁要多久？」——"北京/上海"确实出现在员工手册（分公司地址）中，
-> 纯字面检索无法识别"意图不同"；这类问题需要语义向量或 LLM 相关性判断，属于该模式的固有上限。
+**已知短板（诚实记录，附实测数据）**——离线词法模式的边界都在稠密分平台期上（0.166–0.204），
+用任何单一阈值都只能拆东墙补西墙，所以这 4 例如实列出：
+
+| 现象 | 问题 | 实测诊断 |
+| --- | --- | --- |
+| 误答 ✗ | 我们公司的股票代码是多少？ | 稠密 top=0.204 恰好越过阈值 0.20；"股票"整个概念不在库内，但"公司/代码"是库内高频词 |
+| 误拒 ✗ | V3.2版新增了哪些能力？ | 稠密 top=0.167、BM25 8.63，突出度 1.41（低于救援阈值 2.0）——版本号在标题行、被切在块外 |
+| 误拒 ✗ | JWT Token 的有效期是多久？ | 稠密 top=0.172、BM25 11.49，突出度 1.63；`jwt`/`token` 确实命中，但整体份数分布太平 |
+| 误拒 ✗ | IT服务台的内线电话是多少？ | 稠密 top=0.181、BM25 17.41（命中"内线"），突出度 1.39 被拦 |
+
+> 这四例说明的是**离线 n-gram 向量的结构上限**：它就是没有语义泛化能力，正例与负例的分数完全重叠
+> （应拒绝的「北京到上海的高铁要多久」top=0.166，反而比应回答的「内线电话」0.181 还低——突出度判据在这里甚至是反相关的）。
+> 生产路径（`text-embedding-v3` 语义向量）不存在这个平台期，这也是"语义向量 + Cross-Encoder 重排"被列进路线图的原因。
+> 结论：**阈值不是靠看分数拍的，而是靠 43 题评测集扫出来的（`--tune`），并且我把它的失效边界一起写下来了。**
 
 ### 5.2 首字响应时间（`make bench`）
 
@@ -264,10 +310,12 @@ rag/
 │   ├── ingest.py              命令行入库（--dir/--file/--reset/--force/--status）
 │   ├── evaluate.py            离线评测（hit@k/要点覆盖/拒答准确率/--tune 阈值搜索）
 │   └── benchmark_ttft.py      TTFT 压测（模拟上游 / --live 真实模型）
-├── tests/                     49 个 pytest 用例（解析/切片/检索/生成/编排/API）+ 评测集
+├── tests/                     51 个 pytest 用例（解析/切片/检索/生成/编排/API）+ tests/data/eval_set.json 评测集
 ├── docs/                      内置示例语料（员工手册/产品说明书/FAQ/开发规范）
 ├── data/                      运行期数据（索引/片段/台账/上传文件，已 gitignore）
-├── Dockerfile / docker-compose.yml / Makefile / requirements.txt / .env.example
+├── pyproject.toml / uv.lock   依赖声明 + 锁文件（uv sync 的权威来源）
+├── requirements.txt           等价的 pip 声明（默认版本区间，供不用 uv 的环境）
+├── Dockerfile / docker-compose.yml / Makefile / .env.example
 ```
 
 ---

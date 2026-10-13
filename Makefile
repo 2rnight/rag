@@ -1,11 +1,13 @@
-.PHONY: help install dev serve ingest reset test eval bench lint clean docker
+.PHONY: help install sync dev serve serve-uv ingest reset test eval bench lint clean docker
 
 PY ?= python
+UV ?= uv
 PORT ?= 8000
 
 help:
 	@echo "RAG 知识库问答系统 - 常用命令"
-	@echo "  make install   安装依赖"
+	@echo "  make install   安装依赖（pip）"
+	@echo "  make sync      安装依赖（uv sync，按 uv.lock 可复现）"
 	@echo "  make ingest    索引 docs/ 目录（增量、幂等）"
 	@echo "  make reset     清空并全量重建索引"
 	@echo "  make serve     启动 API 服务（http://localhost:$(PORT)）"
@@ -19,6 +21,9 @@ help:
 install:
 	$(PY) -m pip install -r requirements.txt
 
+sync:
+	$(UV) sync
+
 ingest:
 	$(PY) -m scripts.ingest
 
@@ -27,6 +32,9 @@ reset:
 
 serve:
 	$(PY) -m uvicorn app:app --host 0.0.0.0 --port $(PORT)
+
+serve-uv:
+	$(UV) run uvicorn app:app --host 0.0.0.0 --port $(PORT)
 
 dev: install ingest serve
 

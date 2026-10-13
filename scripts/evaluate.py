@@ -202,7 +202,11 @@ def main() -> int:
         print("知识库为空，正在索引 docs/ ……")
         pipeline.ingest_directory(settings.docs_dir)
 
-    eval_set = json.loads(Path(args.set).read_text(encoding="utf-8"))
+    eval_path = Path(args.set)
+    if not eval_path.exists():
+        print(f"评测集不存在：{eval_path}\n（默认路径是 tests/data/eval_set.json；也可用 --set 指定）")
+        return 2
+    eval_set = json.loads(eval_path.read_text(encoding="utf-8"))
     print(f"\n=== 评测集：{eval_set.get('name', args.set)} ===")
     report = evaluate(pipeline, eval_set, stream=args.stream)
 

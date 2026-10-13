@@ -178,7 +178,16 @@ class HybridRetriever:
                 if score_threshold is not None and score_threshold >= 0
                 else float(getattr(self.vector_store.embeddings.info, "recommended_threshold", 0.30))
             )
-            selected = [hit for hit in fused if hit.score >= threshold or hit.dense_rank is None]
+            # 入选上下文的条件：任一路证据达标即可。
+            # 注意不能只看稠密分——BM25 强命中的片段（专有名词/编号/数字条款类问题）
+            # 稠密分往往低于阈值，只按稠密过滤会把「判定为可答所依赖的那条证据」丢掉。
+            selected = [
+                hit
+                for hit in fused
+                if hit.score >= threshold
+                or hit.dense_rank is None
+                or hit.sparse_score >= self.sparse_rescue_min_score
+            ]
             # 稠密分数是"这题知识库到底有没有答案"的可靠信号（BM25 字面命中容易误判）
             top_score = max((hit.score for hit in fused), default=0.0)
             unknown_ratio = self._unknown_term_ratio(question)

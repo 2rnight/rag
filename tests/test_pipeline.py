@@ -119,3 +119,10 @@ def test_status_and_chunking_stats(local_pipeline, sample_docs):
     assert stats.chunks == len(local_pipeline.chunk_store)
     assert stats.min_chars > 0 and stats.max_chars <= 750
     assert 0 <= stats.overlap_ratio <= 0.2
+
+
+def test_keyword_question_answer_contains_exact_value(pipeline):
+    """端到端：关键词型问题（专有名词/数字条款）的答案必须给出精确值，而不是"看着相关"的邻居段落。"""
+    result = pipeline.answer("交通补贴是多少钱一个月？")
+    assert not result.refused
+    assert "500元" in result.answer

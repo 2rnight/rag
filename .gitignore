@@ -14,8 +14,11 @@ venv/
 *.key
 
 # 运行期数据（索引 / 片段库 / 上传文件 / 评测报告）
-data/
-uploads/
+# 注意：必须写成 /data/ 锚定仓库根目录！写成 data/ 会连 tests/data/ 一起忽略，
+# 导致评测集这类"源码里的数据"永远不会被 git 跟踪（踩过一次）。
+/data/
+/uploads/
+!tests/data/
 *.faiss
 *.pkl
 !tests/**/*.pkl

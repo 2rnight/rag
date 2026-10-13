@@ -55,6 +55,19 @@ def test_hybrid_retrieval_fuses_dense_and_sparse(pipeline):
         assert key in diagnostics
 
 
+def test_sparse_strong_chunk_is_kept_in_context(pipeline):
+    """BM25 强命中但稠密分低于阈值的片段，必须留在喂给 LLM 的上下文里。
+
+    回归用例：上下文筛选曾只按稠密分过滤，于是「判定可答所依赖的那条 BM25 证据」被丢掉，
+    典型症状是命中率正常、答案却答非所问（如「交通补贴是多少钱一个月？」）。
+    """
+    result = pipeline.retrieve("交通补贴是多少钱一个月？", top_k=5)
+    assert result.is_answerable
+    sparse_top = max((hit.sparse_score for hit in result.sparse_hits), default=0.0)
+    assert sparse_top >= pipeline.retriever.sparse_rescue_min_score, "该问题应由 BM25 强命中救援"
+    assert any("交通补贴" in hit.text for hit in result.hits), "BM25 强命中的片段不应被稠密阈值过滤掉"
+
+
 def test_out_of_scope_question_is_refused(pipeline):
     result = pipeline.retrieve("火星殖民地什么时候建成？")
     assert not result.is_answerable
