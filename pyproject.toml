@@ -1,0 +1,16 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faiss-cpu>=1.13.2",
+    "langchain>=1.2.15",
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.1.12",
+    "pypdf>=6.10.0",
+    "python-docx>=1.2.0",
+    "streamlit>=1.56.0",
+    "unstructured>=0.18.32",
+]
