@@ -1,144 +1,182 @@
-"""
-Streamlit Web 界面
-运行: streamlit run app.py
-"""
-import streamlit as st
-import tempfile
-import os
-from rag_engine import RAGEngine
+"""FastAPI 应用入口。
 
-# ===== 页面配置 =====
-st.set_page_config(
-    page_title="📚 智能文档问答系统",
-    page_icon="📚",
-    layout="wide"
+启动：
+    uvicorn app:app --host 0.0.0.0 --port 8000          # 直接跑
+    python app.py                                       # 等价（读取 RAG_PORT）
+    docker compose up -d                                # 容器化
+
+在线体验：
+    http://localhost:8000          演示界面（流式打字机效果）
+    http://localhost:8000/docs     OpenAPI 交互式文档
+"""
+from __future__ import annotations
+
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from api.deps import build_pipeline, pipeline_from_request
+from api.routes import router
+from config import get_settings
+from rag.exceptions import RagError
+from rag.logging_utils import get_logger, setup_logging
+
+settings = get_settings()
+setup_logging(settings.log_level, settings.log_json)
+logger = get_logger("rag.api")
+
+STATIC_DIR = Path(__file__).resolve().parent / "api" / "static"
+
+TAGS_METADATA = [
+    {"name": "chat", "description": "问答：流式（SSE）与非流式，含拒答兜底与引用溯源"},
+    {"name": "knowledge", "description": "知识库管理：上传、列表、删除、重建、状态"},
+    {"name": "system", "description": "系统：健康检查、公开配置、运行指标"},
+]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """启动时加载索引（BM25 缓存命中则秒开），关闭时无需额外清理。"""
+    settings.ensure_dirs()
+    pipeline = build_pipeline(strict=False)
+    app.state.pipeline = pipeline
+    logger.info(
+        "服务启动完成",
+        extra={
+            "extra_fields": {
+                "version": settings.version,
+                "vectors": pipeline.vector_store.size,
+                "chunks": len(pipeline.chunk_store),
+                "llm": pipeline.llm.info.as_dict(),
+                "embedding": pipeline.embeddings.info.fingerprint(),
+                "docs_ui": f"http://localhost:{settings.port}/",
+            }
+        },
+    )
+    yield
+    logger.info("服务已停止")
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.version,
+    description=(
+        "基于 RAG（检索增强生成）的企业/个人知识库智能问答系统。\n\n"
+        "- 多格式文档解析（PDF / Word / Markdown / TXT / CSV / HTML / JSON）\n"
+        "- 重叠窗口切片（Overlap 20%）+ text-embedding-v3 向量化 + FAISS 本地索引\n"
+        "- 混合检索（稠密向量 + BM25）+ RRF 融合 + 拒答兜底\n"
+        "- FastAPI 异步 + SSE 流式输出，首字响应时间（TTFT）大幅降低\n"
+    ),
+    lifespan=lifespan,
+    openapi_tags=TAGS_METADATA,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-# ===== 初始化 =====
-@st.cache_resource
-def get_engine():
-    return RAGEngine()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-engine = get_engine()
 
-# 初始化会话状态
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+@app.middleware("http")
+async def log_requests(request: Request, call_next: Any) -> Any:
+    """访问日志 + 耗时埋点（流式响应只记录到"开始返回"的时间）。"""
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if not request.url.path.startswith("/static"):
+        logger.info(
+            "%s %s -> %s (%.1fms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            extra={
+                "extra_fields": {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "ms": round(elapsed_ms, 1),
+                }
+            },
+        )
+    return response
 
-# ===== 侧边栏 =====
-with st.sidebar:
-    st.title("⚙️ 设置")
 
-    # 知识库状态
-    stats = engine.get_stats()
-    st.metric("知识库向量数", stats["total_vectors"])
-    st.caption(f"状态: {'✅ 就绪' if stats['status'] == 'ready' else '⚠️ 空'}")
-
-    st.divider()
-
-    # 文件上传
-    st.subheader("📁 上传文档")
-    uploaded_files = st.file_uploader(
-        "支持 PDF、Word、TXT、CSV",
-        type=["pdf", "docx", "txt", "csv"],
-        accept_multiple_files=True
+@app.exception_handler(RagError)
+async def rag_error_handler(request: Request, exc: RagError) -> JSONResponse:
+    """业务异常 -> 结构化 JSON（统一错误码，前端好处理）。"""
+    logger.warning("业务异常 %s: %s", type(exc).__name__, exc.message)
+    return JSONResponse(
+        status_code=getattr(exc, "status_code", 500),
+        content={"error": type(exc).__name__, "message": exc.message, "detail": exc.detail},
     )
 
-    if uploaded_files and st.button("🔨 处理文档", type="primary"):
-        with st.spinner("正在处理文档..."):
-            for uploaded_file in uploaded_files:
-                # 保存到临时文件
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=os.path.splitext(uploaded_file.name)[1]
-                ) as tmp:
-                    tmp.write(uploaded_file.getvalue())
-                    tmp_path = tmp.name
 
-                try:
-                    num_chunks = engine.add_file(tmp_path)
-                    st.success(f"✅ {uploaded_file.name}: {num_chunks} 个片段")
-                except Exception as e:
-                    st.error(f"❌ {uploaded_file.name}: {e}")
-                finally:
-                    os.unlink(tmp_path)
+# ---------------------------------------------------------------- 基础设施端点（不带前缀，方便探针直接使用）
 
-        st.rerun()
 
-    st.divider()
+@app.get("/health", include_in_schema=False)
+async def root_health(request: Request) -> dict[str, Any]:
+    pipeline = pipeline_from_request(request)
+    return {
+        "status": "ok" if pipeline.ready else "degraded",
+        "version": settings.version,
+        "vectors": pipeline.vector_store.size,
+        "chunks": len(pipeline.chunk_store),
+        "llm": pipeline.llm.info.as_dict(),
+    }
 
-    # URL 添加
-    st.subheader("🌐 添加网页")
-    url = st.text_input("输入网页 URL")
-    if url and st.button("🔗 添加网页"):
-        with st.spinner("正在抓取网页..."):
-            try:
-                num_chunks = engine.add_url(url)
-                st.success(f"✅ 已添加 {num_chunks} 个片段")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ 添加失败: {e}")
 
-    st.divider()
+@app.get("/metrics", include_in_schema=False)
+async def root_metrics(request: Request) -> dict[str, Any]:
+    from rag.metrics import metrics
 
-    # 批量加载目录
-    if st.button("📂 加载 docs 目录"):
-        with st.spinner("正在加载..."):
-            try:
-                num = engine.build_from_directory("./docs")
-                st.success(f"✅ 已加载 {num} 个片段")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ {e}")
+    return metrics.snapshot()
 
-    # 重置
-    if st.button("🗑️ 重置知识库", type="secondary"):
-        engine.reset_index()
-        st.session_state.chat_history = []
-        st.session_state.messages = []
-        st.rerun()
 
-# ===== 主界面 =====
-st.title("📚 智能文档问答系统")
-st.caption("基于 RAG (Retrieval-Augmented Generation) 技术")
+# ---------------------------------------------------------------- 路由与静态资源
 
-# 显示对话历史
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if "sources" in msg:
-            with st.expander("📎 参考来源"):
-                for src in msg["sources"]:
-                    st.caption(f"📄 {src['file']} | 第 {src['page']} 页")
-                    st.text(src["content"])
+app.include_router(router, prefix="/api/v1")
 
-# 用户输入
-if question := st.chat_input("请输入你的问题..."):
-    # 显示用户消息
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    # 生成回答
-    with st.chat_message("assistant"):
-        with st.spinner("思考中..."):
-            result = engine.query(question, st.session_state.chat_history)
 
-        st.markdown(result["answer"])
+@app.get("/", include_in_schema=False)
+async def index() -> Any:
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file, media_type="text/html; charset=utf-8")
+    return JSONResponse({"message": settings.app_name, "docs": "/docs"})
 
-        if result["sources"]:
-            with st.expander("📎 参考来源"):
-                for src in result["sources"]:
-                    st.caption(f"📄 {src['file']} | 第 {src['page']} 页")
-                    st.text(src["content"])
 
-    # 保存到历史
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": result["answer"],
-        "sources": result["sources"]
-    })
-    st.session_state.chat_history.append({"role": "user", "content": question})
-    st.session_state.chat_history.append({"role": "assistant", "content": result["answer"]})
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Any:
+    icon = STATIC_DIR / "favicon.svg"
+    if icon.exists():
+        return FileResponse(icon, media_type="image/svg+xml")
+    return JSONResponse(status_code=204, content=None)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "app:app",
+        host=settings.host,
+        port=settings.port,
+        reload=False,
+        log_level=settings.log_level.lower(),
+    )

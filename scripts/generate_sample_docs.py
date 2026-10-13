@@ -1,8 +1,19 @@
+"""生成内置示例语料（./docs 下的 4 份中文文档）。
 
+这 4 份文档构成"智远科技"这个虚构企业的私域知识库，被单元测试、
+评测集（tests/data/eval_set.json）与 README 的演示数据一起使用，
+所以内容要**保持稳定**：改动会导致评测指标与文档里记录的数字不一致。
 
-import os
+用法：
+    python -m scripts.generate_sample_docs            # 缺失时补齐
+    python -m scripts.generate_sample_docs --force    # 强制覆盖
+"""
+from __future__ import annotations
 
-os.makedirs("./docs", exist_ok=True)
+import argparse
+from pathlib import Path
+
+DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
 
 # ===== 文档1: 公司员工手册 =====
 handbook = """
@@ -606,16 +617,33 @@ A: 在OA系统 → 人事服务 → 证明开具。选择证明类型，填写�
 """
 
 # ===== 写入文件 =====
-files = {
-    "./docs/员工手册.txt": handbook,
-    "./docs/产品说明书.txt": product_doc,
-    "./docs/技术开发规范.txt": tech_doc,
-    "./docs/常见问题FAQ.txt": faq_doc,
+FILES = {
+    "员工手册.txt": handbook,
+    "产品说明书.txt": product_doc,
+    "技术开发规范.txt": tech_doc,
+    "常见问题FAQ.txt": faq_doc,
 }
 
-for filepath, content in files.items():
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"✅ 已创建: {filepath}")
 
-print(f"\n🎉 共创建 {len(files)} 个测试文档，保存在 ./docs/ 目录下")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="生成内置示例语料")
+    parser.add_argument("--force", action="store_true", help="覆盖已存在的文件")
+    args = parser.parse_args()
+
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    created = skipped = 0
+    for name, content in FILES.items():
+        path = DOCS_DIR / name
+        if path.exists() and not args.force:
+            print(f"跳过（已存在）: {path}")
+            skipped += 1
+            continue
+        path.write_text(content.strip() + "\n", encoding="utf-8")
+        print(f"已生成: {path}")
+        created += 1
+    print(f"\n完成：新建 {created} 个，跳过 {skipped} 个，目录 {DOCS_DIR}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,28 @@
+services:
+  rag:
+    build: .
+    image: rag-kb:latest
+    container_name: rag-kb
+    ports:
+      - "8000:8000"
+    environment:
+      # 模型接入：不填 Key 时自动使用离线兜底（向量 n-gram + 抽取式回答），可完整演示
+      RAG_LLM_PROVIDER: ${RAG_LLM_PROVIDER:-auto}
+      RAG_EMBEDDING_PROVIDER: ${RAG_EMBEDDING_PROVIDER:-auto}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RAG_LLM_MODEL: ${RAG_LLM_MODEL:-qwen-plus}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-text-embedding-v3}
+      RAG_LOG_JSON: "true"
+    volumes:
+      # 索引/片段库/上传文件持久化
+      - ./data:/app/data
+      # 想让容器看到你的文档，把目录挂进来再调 /api/v1/knowledge/rebuild
+      - ./docs:/app/docs:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -1,10 +1,33 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.egg-info/
 build/
 dist/
-wheels/
-*.egg-info
+.venv/
+venv/
 
-# Virtual environments
-.venv
+# 环境与密钥（绝不入库）
+.env
+.env.local
+*.pem
+*.key
+
+# 运行期数据（索引 / 片段库 / 上传文件 / 评测报告）
+data/
+uploads/
+*.faiss
+*.pkl
+!tests/**/*.pkl
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
