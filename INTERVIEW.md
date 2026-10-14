@@ -249,6 +249,9 @@ question →（LRU 命中则跳过）embedding → L2 归一化
 
 ## 8. FastAPI 专题（接口层怎么设计的）
 
+> 📄 **打印版**：仓库根目录 `CHEATSHEET-fastapi.pdf`（A4 单页、三栏、含口诀条）。
+> 内容改了想重新生成：`pip install reportlab` 后 `python -m scripts.build_cheatsheet`（`--font` 可指定中文字体）。
+
 ### 8.1 应用组装（`app.py`）
 
 * `FastAPI(title/version/description/lifespan/openapi_tags/docs_url/redoc_url)` —— 元信息直接变成 `/docs` 文档；

@@ -174,6 +174,8 @@ verify_answer()：引用标注检查 + 与资料的 bigram 覆盖率 ≥ 0.20 �
 
 ## 2.3 FastAPI 用法速查（接口层是怎么搭的）
 
+> 📄 同内容的打印版：[`CHEATSHEET-fastapi.pdf`](CHEATSHEET-fastapi.pdf)（A4 单页，`python -m scripts.build_cheatsheet` 可重新生成）。
+
 | FastAPI 能力 | 在本项目的用法 | 文件 |
 | --- | --- | --- |
 | `FastAPI(lifespan=...)` | 启动时 `ensure_dirs()` + 加载索引并重建 BM25，把流水线挂到 `app.state.pipeline`；**启动失败降级为"空知识库"而不是崩**（可用性优先） | `app.py` |

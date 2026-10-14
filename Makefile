@@ -1,4 +1,4 @@
-.PHONY: help install sync dev serve serve-uv ingest reset test eval bench lint clean docker
+.PHONY: help install sync dev serve serve-uv ingest reset test eval bench cheatsheet lint clean docker
 
 PY ?= python
 UV ?= uv
@@ -15,6 +15,7 @@ help:
 	@echo "  make test      运行 pytest（离线、确定性）"
 	@echo "  make eval      私域测试集评测"
 	@echo "  make bench     TTFT 压测"
+	@echo "  make cheatsheet 生成 A4 单页速查表（PDF，需 reportlab + 中文字体）"
 	@echo "  make docker    构建并启动容器"
 	@echo "  make clean     清理运行期数据（data/）"
 
@@ -46,6 +47,9 @@ eval:
 
 bench:
 	$(PY) -m scripts.benchmark_ttft --repeat 3
+
+cheatsheet:
+	$(PY) -m scripts.build_cheatsheet
 
 clean:
 	rm -rf data .pytest_cache __pycache__
