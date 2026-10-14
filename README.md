@@ -172,6 +172,35 @@ verify_answer()：引用标注检查 + 与资料的 bigram 覆盖率 ≥ 0.20 �
 
 ---
 
+## 2.3 FastAPI 用法速查（接口层是怎么搭的）
+
+| FastAPI 能力 | 在本项目的用法 | 文件 |
+| --- | --- | --- |
+| `FastAPI(lifespan=...)` | 启动时 `ensure_dirs()` + 加载索引并重建 BM25，把流水线挂到 `app.state.pipeline`；**启动失败降级为"空知识库"而不是崩**（可用性优先） | `app.py` |
+| `include_router(prefix="/api/v1")` | 业务路由统一前缀；基础设施端点（`/health`、`/metrics`、`/`、`/favicon.ico`）不带前缀，K8s 探针可直接用 | `app.py` `api/routes.py` |
+| `Depends(get_pipeline)` | 进程内单例流水线（`threading.Lock` 防首次并发竞态）；索引不可用时抛 409，而不是返回半残数据 | `api/deps.py` |
+| `Response model`（Pydantic v2） | 全部端点带 `response_model` → 自动生成 OpenAPI 文档 + 响应过滤；请求侧用 `Field(ge=1, le=20)`、`Literal["user","assistant"]` 做约束校验 | `api/schemas.py` |
+| `Query(...)` / `File(...)` | `question` 长度 1–1000、`top_k` 1–20、`threshold` 0–1、多文件上传 + 类型白名单 + 50MB 上限 | `api/routes.py` |
+| `StreamingResponse` | SSE 主链路：`media_type="text/event-stream"` + `X-Accel-Buffering: no`（关反代缓冲）+ 心跳 | `api/routes.py` `api/sse.py` |
+| `run_in_threadpool` / `asyncio.to_thread` | 同步阻塞逻辑（检索、入库、重建）丢进线程池，**不阻塞事件循环**；原生异步的上游 LLM 流式调用不占线程 | `api/routes.py` `rag/pipeline.py` |
+| `@app.middleware("http")` | 访问日志 + 耗时埋点（流式响应只计到"开始返回"） | `app.py` |
+| `@app.exception_handler(RagError)` | 业务异常 → 结构化 JSON（`status_code` 由异常类给出：415/422/409/502/500），统一契约 | `app.py` `rag/exceptions.py` |
+| `CORSMiddleware` | 默认 `allow_origins=["*"]`（演示用），生产按需收紧；`allow_credentials=False` | `app.py` |
+| `StaticFiles` / `FileResponse` | `/static` 挂载 + `/` 返回零依赖控制台页面（打包进镜像，无需前端构建链） | `app.py` `api/static/index.html` |
+| `include_in_schema=False` | 探针/静态/首页不进 OpenAPI 文档，保持 `/docs` 干净 | `app.py` |
+| `TestClient` | 51 个用例里 API 集成测试直接打 ASGI（无需起服务），并用自写的 `parse_sse()` 断言事件序列 | `tests/test_api.py` |
+
+**三个"为什么"（面试常问）**
+
+1. **为什么流式用 POST 还要再给一个 GET？** POST 是主链路：能带 `history`、`top_k`、`threshold`，且前端用 `fetch + ReadableStream` 可随时 `AbortController` 取消；
+   另外提供 GET 版本是为了兼容浏览器原生 `EventSource`（它只能 GET、不能带 body）。
+2. **为什么流里出错不返回 5xx？** 响应头（200 + `text/event-stream`）在第一片数据写出时就已发送，中途**改不了状态码**；
+   所以异常被包装成 `event: error` 事件下发，前端照样能提示。同步接口才用 `HTTPException`。
+3. **为什么检索要 `to_thread`？** 检索是同步 CPU 计算（FAISS/BM25/融合），直接在 `async def` 里跑会**卡住整个事件循环**，
+   期间所有请求（包括别人的 SSE 心跳）都停摆。丢进线程池（anyio 默认 40 个令牌）既简单又不牺牲并发。
+
+---
+
 ## 3. 快速开始
 
 ### 3.1 安装

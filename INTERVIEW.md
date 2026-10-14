@@ -247,7 +247,84 @@ question →（LRU 命中则跳过）embedding → L2 归一化
 
 ---
 
-## 8. 反问面试官（结尾留印象）
+## 8. FastAPI 专题（接口层怎么设计的）
+
+### 8.1 应用组装（`app.py`）
+
+* `FastAPI(title/version/description/lifespan/openapi_tags/docs_url/redoc_url)` —— 元信息直接变成 `/docs` 文档；
+* **`lifespan`（`@asynccontextmanager`）**：启动时建目录、加载索引、重建 BM25，把流水线挂到 `app.state.pipeline`；
+  加载失败（如 embedding 指纹不匹配）**降级为"空知识库"照常启动**，由接口层给出明确提示 —— 可用性优先，
+  这是"服务起不来"和"服务能起但数据不可用"的取舍，我选后者。
+  （`@app.on_event("startup")` 已废弃，不用它。）
+* **中间件**：`CORSMiddleware`（默认 `*`，生产收紧、`allow_credentials=False`）；
+  `@app.middleware("http")` 记访问日志与耗时 —— 注意**流式响应只记到"开始返回"**，总耗时以 `done` 事件里的 `total_ms` 为准。
+* **异常处理器**：`@app.exception_handler(RagError)` 把业务异常映射成结构化 JSON，`status_code` 由异常类自带
+  （`UnsupportedFileTypeError`=415、`DocumentParseError`=422、`IndexNotReadyError`/`KnowledgeBaseEmptyError`=409、`EmbeddingError`/`LLMError`=502）。
+* **基础设施端点不带前缀**：`/health`、`/metrics`、`/`、`/favicon.ico` 且 `include_in_schema=False`，
+  探针可直接用、文档保持干净；业务路由统一 `include_router(router, prefix="/api/v1")`。
+
+### 8.2 依赖注入（`api/deps.py`）
+
+* 进程内单例 `RagPipeline`：`threading.Lock` + 模块级变量 —— 防"并发首请求同时构建两次"；
+* `get_pipeline()` 是**生成器依赖**（`yield`），FastAPI 支持 `yield` 依赖做请求级清理；这里用它统一取用与错误语义；
+* 降级时的行为：`ready=False` 且索引非空且有 `last_error` → `HTTPException(409)`，**不返回半残数据**；
+* `pipeline_from_request(request)` 从 `app.state` 取，供 `/health` 这类"永远要能应答"的端点使用；
+* 测试里直接 `test_client.app.state.pipeline = pipeline` 注入测试替身 —— 这就是把单例放 `app.state` 而不是模块全局的收益。
+
+### 8.3 端点契约（`api/routes.py` + `api/schemas.py`）
+
+* 每个端点都带 `tags` / `summary` / `response_model` → `/docs` 里可交互调试；
+* 请求校验交给 Pydantic：`question` 1–1000 字（`field_validator` 去空白）、`top_k` 1–20、`threshold` 0–1、
+  `history` 最多 20 条、`role` 用 `Literal["user","assistant"]`；校验失败自动 422，无需手写校验代码；
+* 上传：`list[UploadFile] = File(...)`，**逐文件容错**（一个失败不影响其他）+ 后缀白名单 + 50MB 上限 + `finally: await upload_file.close()`；
+* 删除：`removed_chunks == 0` → 404，符合 HTTP 语义；
+* 目录穿越防护：`_resolve_server_path()` 把 `rebuild` 的目录参数限制在项目目录内（`Path.resolve()` 后前缀校验），越界 400；
+* `GET /chat/stream` 与 `POST /chat/stream` 并存：GET 给浏览器原生 `EventSource`（只能 GET），POST 是前端主链路（可带 history、可 abort）。
+
+### 8.4 异步模型（这一段最容易被追问）
+
+| 场景 | 写法 | 为什么 |
+| --- | --- | --- |
+| 路由调同步业务逻辑（`pipeline.answer` / `retrieve` / `ingest_bytes` / `rebuild_all`） | `await run_in_threadpool(...)` | Starlette 封装的 `anyio.to_thread.run_sync`（默认 40 个线程令牌）。**同步代码在 `async def` 里直接跑会冻住整个事件循环**，别人的 SSE 心跳都会停 |
+| 流式链路里的检索 | `await asyncio.to_thread(self.retrieve, ...)` | `astream_answer` 是 async generator，拿不到路由层工具，用标准库等价写法 |
+| 上游 LLM 流式生成 | 原生 async（`astream`） | IO 密集且天然异步，**不占线程池**，所以 SSE 并发不会被线程池限流 |
+| 纯内存毫秒级计算 | 直接跑 | 30 片段的 FAISS/BM25 是 1–3ms，进线程池的调度开销和收益同级，没必要 |
+
+**并发账**：uvicorn 单进程 = 1 个事件循环 + 40 个线程令牌；
+慢操作（LLM 生成）走 async IO 不占线程，重 CPU（解析/切片/向量化）走线程池且受 40 限制 —— 这就是"SSE 能同时挂很多连接"的原因。
+多 worker 要注意：内存索引会**每个 worker 各存一份**且互相不同步（上传只落到一个 worker），
+所以横向扩展的正确姿势是"单 worker + 多副本 + 共享存储/外置向量库"，或把索引改成外部服务。
+
+### 8.5 SSE 实现（`api/sse.py` 的四个工程细节）
+
+1. **响应头**：`text/event-stream` + `X-Accel-Buffering: no` + `Cache-Control: no-cache, no-transform` + `Content-Encoding: identity`
+   —— 少任何一个，Nginx/反代就可能把流"攒"成一次性输出，TTFT 白优化；
+2. **生产/消费解耦**：`asyncio.Queue(maxsize=64)` + `create_task(produce())`；
+   消费者用 `asyncio.wait_for(queue.get(), timeout=heartbeat)` —— 超时就发 `": ping\n\n"` 心跳（注释行，客户端自动忽略），
+   防网关在空闲 60s 时掐断长连接；`maxsize=64` 天然提供**背压**，不会无限缓冲；
+3. **异常也走事件**：生产端 `try/except` 把异常塞进队列（响应头已发出，改不了状态码），前端收到 `event: error` 照样能提示；
+4. **客户端断开**：`finally` 里 `task.cancel()` 并吞掉 `CancelledError`/`GeneratorExit`，避免上游连接泄漏。
+
+（没有引入 `sse-starlette`：一共就 80 行，自己写更可控，也少一个依赖。）
+
+### 8.6 前端为什么是"手写 SSE"而不是 `EventSource`
+
+`EventSource` 只能 GET、不能带请求体、不能带自定义头，而我们需要 POST 传 `history`/`top_k`/`threshold` 并支持取消。
+所以用 `fetch` + `response.body.getReader()`：按 `\n\n` 切块、处理跨块残留 buffer、跳过 `:` 开头的心跳行、
+`AbortController` 随时中断。**面试可以直接说"SSE 是协议不是库，浏览器原生只有 GET 版，所以我自己解析了协议"。**
+
+### 8.7 FastAPI 专项追问速答
+
+* **为什么选 FastAPI 而不是 Flask/Django？** 原生 async（SSE/并发 IO 必需）+ Pydantic 校验 + 依赖注入 + 自动 OpenAPI，代码量最少。
+* **`async def` 里写阻塞代码会怎样？** 事件循环被占住，所有请求排队，SSE 心跳都发不出去；所以阻塞逻辑必须 `to_thread`/`run_in_threadpool`。
+* **`run_in_threadpool` 和 `asyncio.to_thread` 的区别？** 前者是 Starlette 的封装（默认线程池，40 上限），后者是标准库（走同一个默认执行器）；语义等价，路由层用前者，生成器里用后者。
+* **线程池满了会怎样？** 新的阻塞任务排队等待，表现为接口变慢但不阻塞事件循环；非流式接口在 `docs` 里并发压测能观察到这一层。
+* **为什么 `/health` 不进 OpenAPI？** 探针机器调用，不是业务接口；`include_in_schema=False` 让 `/docs` 只展示需要人读的接口。
+* **怎么验证接口是对的？** `TestClient` 打 ASGI（不起服务）+ 自写 `parse_sse()` 断言事件序列；真机用 `curl -N` 看逐字下发、`/openapi.json` 核对 12 个端点。
+
+---
+
+## 9. 反问面试官（结尾留印象）
 
 * 团队现在的 RAG 是自建还是用平台？检索质量是用人工评测还是 RAGAS 这类自动指标？
 * 线上对幻觉的容忍度如何——更怕"乱答"还是更怕"不答"？（决定阈值策略）
@@ -256,7 +333,7 @@ question →（LRU 命中则跳过）embedding → L2 归一化
 
 ---
 
-## 9. 简历措辞对照（你可以这样写，我都验证过）
+## 10. 简历措辞对照（你可以这样写，我都验证过）
 
 * **文本处理与向量化 pipeline**：混合解析器 + 重叠窗口（Overlap 20%）切片 + `text-embedding-v3` + FAISS 本地索引与相似度召回 ✅（`rag/loaders.py`、`rag/chunking.py`、`rag/embeddings.py`、`rag/vector_store.py`）
 * **低延迟流式响应架构**：FastAPI 异步 + SSE 流式输出，TTFT 降 80%+（脚本实测 −88.6%，3.2s→0.36s）✅（`api/sse.py`、`scripts/benchmark_ttft.py`）
